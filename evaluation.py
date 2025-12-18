@@ -2,6 +2,7 @@
 Evaluation Metrics for Age Estimation
 - MAE, RMSE, Pearson r
 - Bootstrap Confidence Intervals
+- Detailed Statistics and Age-Stratified Analysis
 """
 
 import numpy as np
@@ -300,3 +301,152 @@ def print_evaluation_results(results: Dict[str, Any]):
     print(f"Pearson r: {format_metric_with_ci(metrics['pearson_r'])}")
     
     print("\n" + "="*60)
+
+
+def calculate_detailed_statistics(
+    predictions: np.ndarray,
+    targets: np.ndarray
+) -> Dict[str, Any]:
+    """
+    Calculate detailed statistics for predictions.
+    """
+    errors = predictions - targets
+    abs_errors = np.abs(errors)
+    
+    return {
+        "n_samples": len(predictions),
+        "mae": np.mean(abs_errors),
+        "median_ae": np.median(abs_errors),
+        "rmse": np.sqrt(np.mean(errors**2)),
+        "mean_error": np.mean(errors),  # Bias
+        "std_error": np.std(errors),
+        "min_error": np.min(errors),
+        "max_error": np.max(errors),
+        "q25_abs_error": np.percentile(abs_errors, 25),
+        "q75_abs_error": np.percentile(abs_errors, 75),
+        "within_5_years": np.mean(abs_errors <= 5) * 100,
+        "within_10_years": np.mean(abs_errors <= 10) * 100,
+    }
+
+
+def calculate_age_stratified_metrics(
+    predictions: np.ndarray,
+    targets: np.ndarray,
+    age_bins: List[int] = [0, 30, 40, 50, 60, 70, 100],
+    n_bootstrap: int = 1000
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Calculate metrics stratified by age group with bootstrap CIs.
+    """
+    import pandas as pd
+    
+    bin_labels = [f"{age_bins[i]}-{age_bins[i+1]}" for i in range(len(age_bins)-1)]
+    age_groups = pd.cut(targets, bins=age_bins, labels=bin_labels)
+    
+    results = {}
+    
+    for group in bin_labels:
+        mask = age_groups == group
+        if mask.sum() == 0:
+            continue
+        
+        group_preds = predictions[mask]
+        group_targets = targets[mask]
+        group_errors = np.abs(group_preds - group_targets)
+        
+        # Bootstrap CI for MAE
+        bootstrap_maes = []
+        for _ in range(n_bootstrap):
+            idx = np.random.choice(len(group_errors), size=len(group_errors), replace=True)
+            bootstrap_maes.append(np.mean(group_errors[idx]))
+        
+        results[group] = {
+            "n": int(mask.sum()),
+            "mae": float(np.mean(group_errors)),
+            "mae_ci_lower": float(np.percentile(bootstrap_maes, 2.5)),
+            "mae_ci_upper": float(np.percentile(bootstrap_maes, 97.5)),
+            "rmse": float(np.sqrt(np.mean((group_preds - group_targets)**2))),
+            "mean_bias": float(np.mean(group_preds - group_targets))
+        }
+    
+    return results
+
+
+def compare_predictions_paired(
+    predictions1: np.ndarray,
+    predictions2: np.ndarray,
+    targets: np.ndarray,
+    n_bootstrap: int = 1000
+) -> Dict[str, Any]:
+    """
+    Compare two sets of predictions using paired statistical tests.
+    
+    Returns:
+        Dictionary with statistical test results
+    """
+    errors1 = np.abs(predictions1 - targets)
+    errors2 = np.abs(predictions2 - targets)
+    
+    diff = errors1 - errors2
+    
+    # Paired t-test
+    t_stat, t_pval = stats.ttest_rel(errors1, errors2)
+    
+    # Wilcoxon signed-rank test
+    w_stat, w_pval = stats.wilcoxon(errors1, errors2)
+    
+    # Bootstrap CI for difference
+    bootstrap_diffs = []
+    for _ in range(n_bootstrap):
+        idx = np.random.choice(len(diff), size=len(diff), replace=True)
+        bootstrap_diffs.append(np.mean(diff[idx]))
+    
+    return {
+        "mae_1": float(np.mean(errors1)),
+        "mae_2": float(np.mean(errors2)),
+        "mean_difference": float(np.mean(diff)),
+        "diff_ci_lower": float(np.percentile(bootstrap_diffs, 2.5)),
+        "diff_ci_upper": float(np.percentile(bootstrap_diffs, 97.5)),
+        "t_statistic": float(t_stat),
+        "t_pvalue": float(t_pval),
+        "wilcoxon_statistic": float(w_stat),
+        "wilcoxon_pvalue": float(w_pval),
+        "cohens_d": float(np.mean(diff) / np.std(diff)) if np.std(diff) > 0 else 0
+    }
+
+
+def generate_ci_comparison_table(
+    model_results: Dict[str, Dict[str, Any]]
+) -> str:
+    """
+    Generate a formatted table comparing CIs across models.
+    
+    Returns:
+        LaTeX formatted table string
+    """
+    lines = [
+        r"\begin{table}[htbp]",
+        r"\centering",
+        r"\caption{Model Comparison with 95\% Confidence Intervals}",
+        r"\begin{tabular}{lccc}",
+        r"\toprule",
+        r"Model & MAE (95\% CI) & RMSE (95\% CI) & Pearson $r$ (95\% CI) \\",
+        r"\midrule"
+    ]
+    
+    for model_name, results in model_results.items():
+        metrics = results['metrics']
+        
+        mae_str = f"{metrics['mae']['value']:.3f} ({metrics['mae']['ci_lower']:.3f}--{metrics['mae']['ci_upper']:.3f})"
+        rmse_str = f"{metrics['rmse']['value']:.3f} ({metrics['rmse']['ci_lower']:.3f}--{metrics['rmse']['ci_upper']:.3f})"
+        r_str = f"{metrics['pearson_r']['value']:.3f} ({metrics['pearson_r']['ci_lower']:.3f}--{metrics['pearson_r']['ci_upper']:.3f})"
+        
+        lines.append(f"{model_name} & {mae_str} & {rmse_str} & {r_str} \\\\")
+    
+    lines.extend([
+        r"\bottomrule",
+        r"\end{tabular}",
+        r"\end{table}"
+    ])
+    
+    return "\n".join(lines)

@@ -9,6 +9,7 @@ This script compares 5 models:
 - Swin Transformer
 
 Using 5-fold cross-validation with LR range test.
+Optionally trains final model on full training data.
 """
 
 import os
@@ -29,11 +30,12 @@ from dataset import (
     create_test_dataloader
 )
 from models import AgeEstimationModel, MODEL_DISPLAY_NAMES, print_model_summary
-from trainer import cross_validate
+from trainer_updated import cross_validate, train_final_model, cross_validate_and_train_final
 from evaluation import (
     evaluate_on_test_set,
     evaluate_ensemble,
-    print_evaluation_results
+    print_evaluation_results,
+    bootstrap_all_metrics
 )
 from utils import (
     save_results_json,
@@ -64,14 +66,26 @@ def parse_args():
     parser.add_argument(
         "--train_csv",
         type=str,
-        required=True,
+        default="txt/train_agedetection.csv",
         help="Path to training CSV file"
     )
     parser.add_argument(
         "--test_csv",
         type=str,
-        required=True,
+        default="txt/test_agedetection.csv",
         help="Path to test CSV file"
+    )
+    parser.add_argument(
+        "--train_image_dir",
+        type=str,
+        default="./images/normal20251210/training",
+        help="Directory containing training images"
+    )
+    parser.add_argument(
+        "--test_image_dir",
+        type=str,
+        default="./images/normal20251210/test",
+        help="Directory containing test images"
     )
     parser.add_argument(
         "--output_dir",
@@ -126,8 +140,53 @@ def parse_args():
         action="store_true",
         help="Skip cross-validation (only evaluate on test set)"
     )
+    parser.add_argument(
+        "--train_final",
+        action="store_true",
+        help="Train final model on full training data after CV"
+    )
+    parser.add_argument(
+        "--use_final_for_test",
+        action="store_true",
+        help="Use final model (instead of ensemble) for test evaluation"
+    )
     
     return parser.parse_args()
+
+
+def evaluate_final_model(
+    model_path: str,
+    model_name: str,
+    test_loader,
+    device: str,
+    n_bootstrap: int = 1000
+):
+    """Evaluate the final model on test set."""
+    model = AgeEstimationModel(model_name, pretrained=False).to(device)
+    model.load_state_dict(torch.load(model_path))
+    model.eval()
+    
+    all_preds = []
+    all_targets = []
+    
+    with torch.no_grad():
+        for images, ages in test_loader:
+            images = images.to(device)
+            outputs = model(images)
+            all_preds.extend(outputs.cpu().numpy())
+            all_targets.extend(ages.numpy())
+    
+    predictions = np.array(all_preds)
+    targets = np.array(all_targets)
+    
+    metrics = bootstrap_all_metrics(predictions, targets, n_iterations=n_bootstrap)
+    
+    return {
+        "predictions": predictions.tolist(),
+        "targets": targets.tolist(),
+        "metrics": metrics,
+        "model_type": "final"
+    }
 
 
 def main():
@@ -161,15 +220,9 @@ def main():
     
     # Load data
     print("\nLoading training data...")
-    # 修正後
     train_paths, train_ages = load_data_from_csv(
         config.train_csv,
-        image_dir="./images/normal20251210/training",
-        ext=".jpg"
-    )
-    test_paths, test_ages = load_data_from_csv(
-        config.test_csv,
-        image_dir="./images/normal20251210/test",
+        image_dir=args.train_image_dir,
         ext=".jpg"
     )
     print(f"  Total samples: {len(train_paths)}")
@@ -177,6 +230,11 @@ def main():
     print(f"  Mean age: {np.mean(train_ages):.1f} ± {np.std(train_ages):.1f} years")
     
     print("\nLoading test data...")
+    test_paths, test_ages = load_data_from_csv(
+        config.test_csv,
+        image_dir=args.test_image_dir,
+        ext=".jpg"
+    )
     print(f"  Total samples: {len(test_paths)}")
     print(f"  Age range: {min(test_ages):.1f} - {max(test_ages):.1f} years")
     print(f"  Mean age: {np.mean(test_ages):.1f} ± {np.std(test_ages):.1f} years")
@@ -190,6 +248,7 @@ def main():
     
     # Results storage
     all_cv_results = {}
+    all_final_results = {}
     all_test_results = {}
     
     # Cross-validation for each model
@@ -200,58 +259,84 @@ def main():
         print(f"{'#'*60}")
         
         if not args.skip_cv:
-            # Cross-validation
-            cv_results = cross_validate(
+            # Cross-validation (and optionally train final model)
+            results = cross_validate_and_train_final(
                 model_name=model_name,
                 image_paths=train_paths,
                 ages=train_ages,
                 fold_splits=fold_splits,
                 config=config,
-                device=device
+                device=device,
+                train_final=args.train_final
             )
-            all_cv_results[model_name] = cv_results
+            
+            all_cv_results[model_name] = results["cv_results"]
+            
+            if results["final_model_results"]:
+                all_final_results[model_name] = results["final_model_results"]
             
             # Save CV results
             save_results_json(
-                cv_results,
+                results["cv_results"],
                 Path(config.output_dir) / f"{model_name}_cv_results.json"
             )
-        
-        # Test set evaluation with ensemble
-        print(f"\nEvaluating {display_name} on test set (ensemble)...")
-        
-        model_paths = [
-            Path(config.output_dir) / f"{model_name}_fold{i+1}.pth"
-            for i in range(config.n_folds)
-        ]
-        
-        # Check if all fold models exist
-        if all(p.exists() for p in model_paths):
-            test_loader = create_test_dataloader(test_paths, test_ages, config)
             
-            test_results = evaluate_ensemble(
-                model_paths=[str(p) for p in model_paths],
-                model_class=AgeEstimationModel,
-                model_name=model_name,
-                test_loader=test_loader,
-                device=device,
-                n_bootstrap=config.bootstrap_n_iterations,
-                ci=config.bootstrap_ci
-            )
-            
-            all_test_results[model_name] = test_results
-            print_evaluation_results(test_results)
-            
-            # Save predictions
-            save_predictions_csv(
-                np.array(test_results["predictions"]),
-                np.array(test_results["targets"]),
-                test_paths,
-                Path(config.output_dir) / f"{model_name}_test_predictions.csv"
+            if results["final_model_results"]:
+                save_results_json(
+                    results["final_model_results"],
+                    Path(config.output_dir) / f"{model_name}_final_results.json"
+                )
+        
+        # Test set evaluation
+        print(f"\nEvaluating {display_name} on test set...")
+        test_loader = create_test_dataloader(test_paths, test_ages, config)
+        
+        # Decide which model to use for test evaluation
+        final_model_path = Path(config.output_dir) / f"{model_name}_final.pth"
+        
+        if args.use_final_for_test and final_model_path.exists():
+            # Use final model
+            print("  Using final model (trained on full data)")
+            test_results = evaluate_final_model(
+                str(final_model_path),
+                model_name,
+                test_loader,
+                device,
+                n_bootstrap=config.bootstrap_n_iterations
             )
         else:
-            print(f"  Warning: Not all fold models found for {model_name}")
-            print(f"  Expected: {[str(p) for p in model_paths]}")
+            # Use ensemble of fold models
+            model_paths = [
+                Path(config.output_dir) / f"{model_name}_fold{i+1}.pth"
+                for i in range(config.n_folds)
+            ]
+            
+            if all(p.exists() for p in model_paths):
+                print("  Using ensemble of fold models")
+                test_results = evaluate_ensemble(
+                    model_paths=[str(p) for p in model_paths],
+                    model_class=AgeEstimationModel,
+                    model_name=model_name,
+                    test_loader=test_loader,
+                    device=device,
+                    n_bootstrap=config.bootstrap_n_iterations,
+                    ci=config.bootstrap_ci
+                )
+                test_results["model_type"] = "ensemble"
+            else:
+                print(f"  Warning: Not all fold models found for {model_name}")
+                continue
+        
+        all_test_results[model_name] = test_results
+        print_evaluation_results(test_results)
+        
+        # Save predictions
+        save_predictions_csv(
+            np.array(test_results["predictions"]),
+            np.array(test_results["targets"]),
+            test_paths,
+            Path(config.output_dir) / f"{model_name}_test_predictions.csv"
+        )
     
     # Save summary results
     if all_cv_results:
@@ -278,6 +363,7 @@ def main():
         print(f"\n{'*'*60}")
         print(f"Best Model: {MODEL_DISPLAY_NAMES.get(best_model, best_model)}")
         print(f"Test MAE: {best_mae:.3f} years")
+        print(f"Evaluation Type: {all_test_results[best_model].get('model_type', 'unknown')}")
         print(f"{'*'*60}")
     
     # Save experiment log
@@ -286,12 +372,29 @@ def main():
     log["results"] = {
         "best_model": best_model if all_test_results else None,
         "cv_results_available": list(all_cv_results.keys()),
+        "final_models_trained": list(all_final_results.keys()),
         "test_results_available": list(all_test_results.keys())
     }
     save_experiment_log(log, Path(config.output_dir) / "experiment_log.json")
     
     print(f"\nExperiment completed in {(end_time - start_time).total_seconds():.1f} seconds")
     print(f"Results saved to: {config.output_dir}")
+    
+    # Summary of saved models
+    print("\n" + "="*60)
+    print("Saved Models Summary")
+    print("="*60)
+    for model_name in config.models:
+        print(f"\n{MODEL_DISPLAY_NAMES.get(model_name, model_name)}:")
+        for fold in range(1, config.n_folds + 1):
+            fold_path = Path(config.output_dir) / f"{model_name}_fold{fold}.pth"
+            if fold_path.exists():
+                print(f"  ✓ Fold {fold}: {fold_path}")
+        final_path = Path(config.output_dir) / f"{model_name}_final.pth"
+        if final_path.exists():
+            print(f"  ✓ Final (full data): {final_path}")
+        else:
+            print(f"  ✗ Final model not trained (use --train_final)")
 
 
 if __name__ == "__main__":
