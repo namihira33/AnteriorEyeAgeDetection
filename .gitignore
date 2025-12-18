@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# 環境変数
+.env
+
+# IDE
+.vscode/
+.idea/
+
+# データ・モデル（大きいファイル）
+*.csv
+*.h5
+*.pt
+*.pth
+images/
+txt/
+results/
+wandb/
